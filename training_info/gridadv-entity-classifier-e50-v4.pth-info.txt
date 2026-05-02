@@ -1,0 +1,29 @@
+Model saved: gridadv-entity-classifier-e50-v4.pth
+floor: train=40, test=10
+wall: train=21, test=4
+agent: train=636, test=164
+exit: train=453, test=97
+coin: train=488, test=137
+gem: train=489, test=136
+key: train=456, test=94
+locked_door: train=430, test=120
+lava: train=21, test=4
+box: train=385, test=90
+boots: train=434, test=116
+shield: train=387, test=88
+ghost: train=500, test=125
+
+Final Accuracy: 1.0000
+floor: 1.0000 (10 samples)
+wall: 1.0000 (4 samples)
+agent: 1.0000 (164 samples)
+exit: 1.0000 (97 samples)
+coin: 1.0000 (137 samples)
+gem: 1.0000 (136 samples)
+key: 1.0000 (94 samples)
+locked_door: 1.0000 (120 samples)
+lava: 1.0000 (4 samples)
+box: 1.0000 (90 samples)
+boots: 1.0000 (116 samples)
+shield: 1.0000 (88 samples)
+ghost: 1.0000 (125 samples)

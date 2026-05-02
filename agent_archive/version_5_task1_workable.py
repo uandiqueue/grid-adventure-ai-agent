@@ -1,0 +1,1043 @@
+# Input states for Agent step function
+from grid_adventure.grid import GridState
+from grid_adventure.env import ImageObservation
+
+# State steppers
+from grid_adventure.step import Action
+from grid_adventure.grid import step as grid_step
+
+# Movements and Objectives are gridstate parameters. For Grid Adventure V1, we will be using the default ones.
+from grid_adventure.movements import MOVEMENTS
+from grid_adventure.objectives import OBJECTIVES
+
+#Next, we import the methods to create the various entities in the game.
+from grid_adventure.entities import (
+    AgentEntity,
+    FloorEntity,
+    WallEntity,
+    ExitEntity,
+    CoinEntity,
+    GemEntity,
+    KeyEntity,
+    LockedDoorEntity,
+    UnlockedDoorEntity,
+    LavaEntity,
+    BoxEntity,
+    SpeedPowerUpEntity,
+    ShieldPowerUpEntity,
+    PhasingPowerUpEntity,
+)
+
+# Utility helpers
+from dataclasses import dataclass
+from typing import Callable
+from collections import deque
+
+# Custom data structures
+# Reference: https://docs.python.org/3/library/dataclasses.html
+@dataclass(frozen=True)
+class SearchState:
+    agent_pos: tuple[int, int] | None
+    agent_hp: int
+    key_inventory: int
+    speed_time_left: int
+    shield_usage_left: int
+    phasing_time_left: int
+    coins: tuple[tuple[int, int], ...]
+    gems: tuple[tuple[int, int], ...]
+    keys: tuple[tuple[int, int], ...]
+    boxes: tuple[tuple[int, int], ...]
+    locked_doors: tuple[tuple[int, int], ...]
+    speed_pos: tuple[tuple[int, int], ...]
+    shield_pos: tuple[tuple[int, int], ...]
+    phasing_pos: tuple[tuple[int, int], ...]
+
+# Reference: https://share.google/aimode/RXU3vaCbjRdnVjJ4p
+# Reference: https://share.google/aimode/eRUKo9Mjmjp5fkuBc
+@dataclass(frozen=True)
+class StaticMap:
+    width: int
+    height: int
+    exit: tuple[int, int] | None
+    walls: tuple[tuple[int, int], ...]
+    lava: tuple[tuple[int, int], ...]
+    num_coins: int
+    wall_set: frozenset[tuple[int, int]] = frozenset()
+    lava_set: frozenset[tuple[int, int]] = frozenset()
+
+# Utility classes (adapted from PS1)
+import heapq
+class Node:
+    r"""Node class for search tree
+    Args:
+        parent (Node): the parent node of this node in the tree
+        act (Action): the action taken from parent to reach this node
+        state (GridState): the state of this node
+        cost (float): the path cost of reaching this state
+    """
+    
+    def __init__(
+            self, 
+            parent: "Node", 
+            act, 
+            state: GridState | None = None, 
+            search_state: SearchState | None = None,
+            lightweight_win: bool = False,
+            cost: float = 0.0):
+
+        self.parent = parent # where am I from
+        self.act = act # how to get here
+        self.state = state # who am I
+        self.search_state = search_state # the search state associated with this node
+        self.lightweight_win = lightweight_win # whether this node is a win state (for lightweight moves)
+        self.cost = cost # what it costs to be here
+
+    def __str__(self):
+        return str(self.state)
+
+    def __lt__(self, node):
+        """Compare the path cost between states"""
+        return self.cost < node.cost
+
+    def __eq__(self, node):
+        """Compare whether two nodes have the same state"""
+        return isinstance(node, Node) and self.state == node.state
+
+    def __hash__(self):
+        """Node can be used as a KeyValue"""
+        return hash(self.state)
+    
+    def has_search_state(self):
+        return self.search_state is not None
+
+class PriorityQueue:
+    def __init__(self):
+        self.heap = []
+
+    def __contains__(self, node):
+        """Decide whether the node (state) is in the queue"""
+        return any([item == node for _, item in self.heap])
+
+    def __delitem__(self, node):
+        """Delete the an existing node in the queue"""
+        try: 
+            del self.heap[[item == node for _, item in self.heap].index(True)]
+        except ValueError:
+            raise KeyError(str(node) + " is not in the queue")
+        heapq.heapify(self.heap) # O(n)
+
+    def __getitem__(self, node):
+        """Return the priority of the given node in the queue"""
+        for value, item in self.heap:
+            if item == node:
+                return value
+        raise KeyError(str(node) + " is not in the queue")
+
+    def __len__(self):
+        return len(self.heap)
+
+    def __repr__(self):
+        string = '['
+        for priority, node in self.heap:
+            string += f"({priority}, {node}), "
+        string += ']'
+        return string
+
+    def push(self, priority, node):
+        """Enqueue node with priority"""
+        heapq.heappush(self.heap, (priority, node))
+
+    def pop(self):
+        """Dequeue node with highest priority (the minimum one)"""
+        if self.heap:
+            return heapq.heappop(self.heap)[1]
+        else:
+            raise Exception("Empty priority queue")
+
+    def get_priority(self, node):
+        return self.__getitem__(node)
+
+MOVES = {
+    Action.UP: (0, -1),
+    Action.DOWN: (0, 1),
+    Action.LEFT: (-1, 0),
+    Action.RIGHT: (1, 0)
+}
+
+class Agent:
+    """Grid Adventure: Variant 1 agent template.
+
+    This class is the single public interface that Coursemology will import and
+    interact with when evaluating your submission. You should extend the
+    internals (add helper classes / functions in other files if you wish) but
+    MUST preserve:
+
+    1. The class name: Agent
+    2. The public method: step(self, state: GridState | ImageObservation) -> Action
+
+    High‑level lifecycle per environment tick:
+        state  --->  step(...)  --->  Action
+
+    The "state" object type depends on the task:
+    - Task 1: A fully structured GridState instance.
+    - Task 2: An ImageObservation dictionary whose primary observation is an RGBA image
+      plus limited structured metadata in the 'info' sub‑dict. In this case you
+      typically perform perception to build (or approximate) an internal
+      structured representation before planning.
+    - Task 3: Input state could be either a GridState instance 
+      or an ImageObservation dictionary
+
+    Constraints:
+    - Keep per‑step latency small (single CPU, ~1GB RAM). Avoid O(W*H) scans of
+      the full grid every step.
+    - Determinism helps reproducibility; seed your own RNG if you add any
+      random components.
+
+    You may add __init__ parameters (with defaults) if needed for your own
+    development, but the grader will instantiate Agent() with no arguments.
+    """
+    
+    def __init__(self):
+        """Initialize your agent.
+
+        Put all one‑time setup here (e.g., hardcoded ML model weights,
+        precomputing heuristic tables). Keep it fast and memory‑light 
+        to respect platform limits.
+        """
+        self.cached_actions = None # list[Action]
+        self.cached_actions_index = None
+        self.prev_action = None # Action
+        self.prev_state = None # GridState
+        self.heuristic_gem_mst_cache = {} # dict[tuple[tuple[int, int], ...], int] list of gems_pos -> mst cost
+        self.cached_static_map = None # StaticMap
+        self.dist_to_exit = None # dict[(x,y) -> int] exit as source
+        self.sssp_cache = {} # dict[(x,y) -> dict[(x,y) -> int]] different source pos
+
+    def step(self, state: GridState | ImageObservation) -> Action:
+        """Return the next action given the current environment state.
+
+        Parameters
+        ----------
+        state : GridState | ImageObservation
+            - If a GridState instance (Tasks 1 and 3): you have direct, structured
+              access to grid, entities, objective message, score, etc.
+            - If a ImageObservation dict (Tasks 2 and 3): contains 'image' (H×W×4 RGBA uint8)
+              plus 'info' sub‑dictionary (agent stats, partial config, message).
+              You likely need to parse the image into an internal representation.
+
+        Returns
+        -------
+        Action
+            A valid action from the Action enum. Must always return a member;
+            never return None.
+        """
+        # Reference: https://share.google/aimode/IWyPP9kZB0CJoUa1l
+        if isinstance(state, dict) and 'image' in state:
+            state = self.parse_img(state)  # Convert image observation to GridState
+        
+        # Use cached actions if available
+        prev_state = self.prev_state
+        prev_action = self.prev_action
+        if self.cached_actions is not None:
+            self.cached_actions_index += 1
+            if self.cached_actions_index < len(self.cached_actions):
+                action = self.cached_actions[self.cached_actions_index]
+                self.prev_state = state
+                self.prev_action = action
+                # Debug
+                # print(f"Using cached action: {action}")
+                return action
+            self.cached_actions = None
+            self.cached_actions_index = None
+
+        # Cache static map and exit sssp
+        if self.cached_static_map is None:
+            static_map = self.parse_static_map(state)
+            self.cached_static_map = static_map
+            self.dist_to_exit = self.sssp_dist(static_map.exit, static_map)
+            self.sssp_cache[static_map.exit] = self.dist_to_exit
+        static_map = self.cached_static_map
+        result = self.astar_search(state, self.heuristic_func, static_map)
+        if result is False:
+            return Action.WAIT
+
+        actions, _ = result
+        if not actions:
+            return Action.WAIT
+        
+        self.cached_actions_index = 0
+        self.cached_actions = actions
+        self.prev_action = self.cached_actions[self.cached_actions_index]
+        self.prev_state = state
+
+        return actions[self.cached_actions_index]
+
+    ## PARSE METHODS
+    
+    def parse_img(self, observation: ImageObservation) -> GridState:
+        """Parse image observation into GridState representation.
+
+        NOTE: This method is optional and intended for debugging in Grid Play only. 
+        You do not need to implement it for Coursemology submission, but it can be 
+        helpful for visualizing your agent's perception during development. 
+        Implementing this method will not affect grading.
+
+        Parameters
+        ----------
+        observation : ImageObservation
+            The raw image observation and metadata from the environment.
+
+        Returns
+        -------
+        GridState
+            The reconstructed internal representation of the environment state.
+        """
+        # Placeholder: implement perception logic here
+        pass
+
+    def parse_static_map(self, state: GridState) -> StaticMap:
+        width = state.width
+        height = state.height
+        exit = None
+        walls = []
+        lava = []
+        num_coins = 0
+        for x in range(state.width):
+            for y in range(state.height):
+                pos = (x, y)
+                entities = state.objects_at(pos)
+                for e in entities:
+                    if isinstance(e, ExitEntity):
+                        exit = pos
+                    elif isinstance(e, WallEntity):
+                        walls.append(pos)
+                    elif isinstance(e, LavaEntity):
+                        lava.append(pos)
+                    elif isinstance(e, CoinEntity):
+                        num_coins += 1
+        walls_tuple = tuple(sorted(walls))
+        return StaticMap(
+            width=width,
+            height=height,
+            exit=exit,
+            walls=walls_tuple,
+            lava=tuple(sorted(lava)),
+            num_coins=num_coins,
+            wall_set=frozenset(walls),
+            lava_set=frozenset(lava)
+        )
+    
+    def parse_search_state(self, state: GridState) -> SearchState:
+        agent_pos = None
+        agent_hp = 0
+        key_inventory = 0
+        speed_time_left = 0
+        shield_usage_left = 0
+        phasing_time_left = 0
+        coins = []
+        gems = []
+        keys = []
+        boxes = []
+        locked_doors = []
+        speed_pos = []
+        shield_pos = []
+        phasing_pos = []
+
+        for x in range(state.width):
+            for y in range(state.height):
+                pos = (x, y)
+                entities = state.objects_at(pos)
+                for e in entities:
+                    if isinstance(e, AgentEntity):
+                        agent_pos = pos
+                        agent_hp = e.health.current_health
+                        key_inventory = self.count_inventory_keys(e)
+                        speed_time_left, shield_usage_left, phasing_time_left = self.count_active_powerups(e)
+                    elif isinstance(e, CoinEntity):
+                        coins.append(pos)
+                    elif isinstance(e, GemEntity):
+                        gems.append(pos)
+                    elif isinstance(e, KeyEntity):
+                        keys.append(pos)
+                    elif isinstance(e, BoxEntity):
+                        boxes.append(pos)
+                    elif isinstance(e, LockedDoorEntity):
+                        locked_doors.append(pos)
+                    elif isinstance(e, SpeedPowerUpEntity):
+                        speed_pos.append(pos)
+                    elif isinstance(e, ShieldPowerUpEntity):
+                        shield_pos.append(pos)
+                    elif isinstance(e, PhasingPowerUpEntity):
+                        phasing_pos.append(pos)
+        return SearchState(
+            agent_pos=agent_pos,
+            agent_hp=agent_hp,
+            key_inventory=key_inventory,
+            speed_time_left=speed_time_left,
+            shield_usage_left=shield_usage_left,
+            phasing_time_left=phasing_time_left,
+            coins=tuple(sorted(coins)),
+            gems=tuple(sorted(gems)),
+            keys=tuple(sorted(keys)),
+            boxes=tuple(sorted(boxes)),
+            locked_doors=tuple(sorted(locked_doors)),
+            speed_pos=tuple(sorted(speed_pos)),
+            shield_pos=tuple(sorted(shield_pos)),
+            phasing_pos=tuple(sorted(phasing_pos))
+        )
+
+    def derive_search_state(self, 
+                            new_grid_state: GridState, 
+                            parent_search_state: SearchState, 
+                            action: Action, 
+                            static_map: StaticMap
+                            ) -> SearchState:
+        # Initialise new search state variables
+        s = parent_search_state
+        new_agent_pos = s.agent_pos
+        new_agent_hp = s.agent_hp
+        new_key_inventory = s.key_inventory
+        new_speed_time_left = s.speed_time_left
+        new_shield_usage_left = s.shield_usage_left
+        new_phasing_time_left = s.phasing_time_left
+        new_coins = s.coins
+        new_gems = s.gems
+        new_keys = s.keys
+        new_boxes = s.boxes
+        new_locked_doors = s.locked_doors
+        new_speed_pos = s.speed_pos
+        new_shield_pos = s.shield_pos
+        new_phasing_pos = s.phasing_pos
+
+        # Get from new_grid_state
+        (pos_x, pos_y) = s.agent_pos
+        if s.speed_time_left > 0:
+            range_bound = range(-2, 3)
+        else:
+            range_bound = range(-1, 2)
+        found = False
+        for diff_x in range_bound:
+            if found:
+                break
+            for diff_y in range_bound:
+                check_pos = (pos_x + diff_x, pos_y + diff_y)
+                if not (0 <= check_pos[0] < static_map.width and 0 <= check_pos[1] < static_map.height):
+                    continue
+                entities = new_grid_state.objects_at(check_pos)
+                for e in entities:
+                    if isinstance(e, AgentEntity):
+                        new_agent_pos = check_pos
+                        new_agent_hp = e.health.current_health
+                        new_key_inventory = self.count_inventory_keys(e)
+                        new_speed_time_left, new_shield_usage_left, new_phasing_time_left = self.count_active_powerups(e)
+                        found = True
+                        break
+
+        # Self-derive
+        if action == Action.WAIT:
+            pass
+
+        elif action == Action.USE_KEY:
+            new_locked_doors = list(s.locked_doors)
+            # Unlocks min(keys, surrounding_doors) simultaneously
+            # Priority: CURRENT, LEFT, RIGHT, UP, DOWN
+            for diff_x, diff_y in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)]:
+                check_pos = (pos_x + diff_x, pos_y + diff_y)
+                if not (0 <= check_pos[0] < static_map.width and 0 <= check_pos[1] < static_map.height):
+                    continue
+                if check_pos in new_locked_doors:
+                    for e in new_grid_state.objects_at(check_pos):
+                        if isinstance(e, UnlockedDoorEntity):
+                            new_locked_doors.remove(check_pos)
+                            break
+            new_locked_doors = tuple(new_locked_doors)
+        
+        # Update position of pickables
+        elif action == Action.PICK_UP:
+            pos = new_agent_pos
+            if pos in s.coins:
+                new_coins = tuple(p for p in s.coins if p != pos)
+            elif pos in s.gems:
+                new_gems = tuple(p for p in s.gems if p != pos)
+            elif pos in s.keys:
+                new_keys = tuple(p for p in s.keys if p != pos)
+            elif pos in s.speed_pos:
+                new_speed_pos = tuple(p for p in s.speed_pos if p != pos)
+            elif pos in s.shield_pos:
+                new_shield_pos = tuple(p for p in s.shield_pos if p != pos)
+            elif pos in s.phasing_pos:
+                new_phasing_pos = tuple(p for p in s.phasing_pos if p != pos)
+
+        # Check for boxes
+        elif action in [Action.UP, Action.DOWN, Action.LEFT, Action.RIGHT]:
+            if s.boxes and new_agent_pos != s.agent_pos:
+                move_x, move_y = MOVES[action]
+                new_boxes_list = []
+                for box_pos in s.boxes:
+                    # Check if still at old position
+                    still_there = any(isinstance(e, BoxEntity) for e in new_grid_state.objects_at(box_pos))
+                    if still_there:
+                        new_boxes_list.append(box_pos)
+                    else:
+                        # Box moved, search 1 or 2 tiles in movement direction
+                        for dist in range(1, 3):
+                            new_pos = (box_pos[0] + move_x * dist, box_pos[1] + move_y * dist)
+                            if 0 <= new_pos[0] < static_map.width and 0 <= new_pos[1] < static_map.height:
+                                if any(isinstance(e, BoxEntity) for e in new_grid_state.objects_at(new_pos)):
+                                    new_boxes_list.append(new_pos)
+                                    break
+                new_boxes = tuple(sorted(new_boxes_list))
+        
+        return SearchState(
+            agent_pos = new_agent_pos,
+            agent_hp = new_agent_hp,
+            key_inventory = new_key_inventory,
+            speed_time_left = new_speed_time_left,
+            shield_usage_left = new_shield_usage_left,
+            phasing_time_left = new_phasing_time_left,
+            coins = new_coins,
+            gems = new_gems,
+            keys = new_keys,
+            boxes = new_boxes,
+            locked_doors = new_locked_doors,
+            speed_pos = new_speed_pos,
+            shield_pos = new_shield_pos,
+            phasing_pos = new_phasing_pos
+        )
+    
+    # If need to reduce for dict lookup
+    def reduce_search_state(self, search_state: SearchState):
+        return (
+            search_state.agent_pos,
+            search_state.agent_hp,
+            search_state.key_inventory,
+            search_state.speed_time_left,
+            search_state.shield_usage_left,
+            search_state.phasing_time_left,
+            # Prune coins as heuristic handles it, and detour is never profitable
+            search_state.gems,
+            # Convert keys to len because any key can unlock any door
+            # Astar will choose the key collected with lower cost
+            # Prune key as number is stored in key_inventory
+            search_state.boxes,
+            search_state.locked_doors,
+            # Prune speed as its position only leads to small wastage in score if missed
+            search_state.shield_pos,
+            search_state.phasing_pos
+        )
+
+
+    ## SEARCH METHODS
+
+    def astar_search(self, state: GridState, heuristic_func: Callable, static_map: StaticMap) -> list[Action] | bool:
+        r"""
+        A* Search finds the solution to reach the goal from the initial.
+        If no solution is found, return False.
+        
+        Args:
+            state (GridState): GridState instance
+            heuristic_func (Callable): heuristic function for the A* search
+
+        Returns:
+            solution (List[Action]): the action sequence
+            num_nodes_expand (int): the number of nodes expanded during the search
+            OR
+            False: if no solution is found
+        """
+        fail = True
+        solution = []
+
+        reached = {} # dict[SearchState (reduced), int]
+        frontier = PriorityQueue()
+        initial = state
+        initial_search_state = self.parse_search_state(initial)
+        reached[self.reduce_search_state(initial_search_state)] = 0
+        curr = Node(parent=None,
+                    act=None,
+                    state=initial,
+                    search_state=initial_search_state,
+                    cost=0)
+        num_nodes_expand = 0
+        # Adaptive weight: more greedy for complex levels
+        complexity = (len(initial_search_state.gems)
+                      + len(initial_search_state.keys)
+                      + len(initial_search_state.locked_doors)
+                      + len(initial_search_state.boxes)
+                      + len(initial_search_state.speed_pos)
+                      + len(initial_search_state.shield_pos)
+                      + len(initial_search_state.phasing_pos))
+        if complexity > 12:
+            ASTAR_WEIGHT = 4
+        elif complexity > 8:
+            ASTAR_WEIGHT = 3
+        elif complexity > 4:
+            ASTAR_WEIGHT = 2
+        else:
+            ASTAR_WEIGHT = 1
+
+        frontier.push((curr.cost + ASTAR_WEIGHT * heuristic_func(static_map, initial_search_state)), curr)
+
+        while frontier.__len__() > 0:
+            next_node = frontier.pop() # next_node is Node instance
+            if not next_node.has_search_state():
+                next_search_state = self.parse_search_state(next_node.state) # state is GridState instance
+            else:
+                next_search_state = next_node.search_state
+            next_key = self.reduce_search_state(next_search_state)  
+            if next_node.cost > reached.get(next_key, float("inf")):
+                continue
+            # Check win/lose, support both GridState and lightweight
+            is_win = getattr(next_node, 'lightweight_win', False) or (next_node.state is not None and next_node.state.win)
+            is_lose = (next_node.state is not None and next_node.state.lose) or (next_search_state.agent_hp <= 0)
+            if is_win:
+                curr = next_node
+                fail = False
+                break
+            elif is_lose:
+                continue
+            else:
+                for child_node in self.expand(next_node, next_search_state, static_map):
+                    num_nodes_expand += 1
+                    if child_node is None:
+                        continue
+                    child_search_state = child_node.search_state
+                    child_key = self.reduce_search_state(child_search_state)
+                    prev_cost = reached.get(child_key, float("inf"))
+                    if child_node.cost < prev_cost:
+                        reached[child_key] = child_node.cost
+                        frontier.push((child_node.cost + ASTAR_WEIGHT * heuristic_func(static_map, child_search_state)), child_node)
+
+        if not fail:
+            while curr.parent:
+                solution.append(curr.act)
+                curr = curr.parent
+        solution.reverse()
+
+        if fail:
+            return False
+        return solution, num_nodes_expand
+
+    def heuristic_func(self, static_map: StaticMap, search_state: SearchState) -> float:
+        has_phase = search_state.phasing_time_left > 0
+        agent = search_state.agent_pos
+        dist_exit = self.dist_to_exit  # precomputed SSSP from exit
+        speed_time = search_state.speed_time_left
+
+        # No gems: move to exit
+        if len(search_state.gems) == 0:
+            if has_phase:
+                agent_to_exit = self.manhattan(agent, static_map.exit)
+            else:
+                agent_to_exit = dist_exit.get(agent, self.manhattan(agent, static_map.exit))
+            movement_turns = self.lower_bound(agent_to_exit, speed_time)
+            # Use cost for heuristic
+            turn_cost = max(0, movement_turns - 1) * 3 # winning step free
+            coin_benefit = len(search_state.coins) * 5
+            return max(0, turn_cost - coin_benefit)
+            # return turn_cost
+        
+        # Have gems
+        # Min distance from gem to exit (SSSP from exit)
+        if has_phase:
+            min_gem_to_exit = min(self.manhattan(g, static_map.exit) for g in search_state.gems)
+        else:
+            min_gem_to_exit = min(dist_exit.get(g, self.manhattan(g, static_map.exit)) for g in search_state.gems)
+        # Min distance from agent to gem (SSSP from agent)
+        if has_phase:
+            min_agent_to_gem = min(self.manhattan(agent, g) for g in search_state.gems)
+        else:
+            dist_agent = self.get_sssp(agent, static_map)
+            min_agent_to_gem = min(dist_agent.get(g, self.manhattan(agent, g)) for g in search_state.gems)
+        # Min distance between gems (MST with SSSP)
+        gem_mst_distance = 0
+        if len(search_state.gems) > 1:
+            cache_key = search_state.gems
+            if cache_key in self.heuristic_gem_mst_cache:
+                gem_mst_distance = self.heuristic_gem_mst_cache[cache_key]
+            else:
+                gem_mst_distance = self.mst_cost(search_state.gems, static_map)
+                self.heuristic_gem_mst_cache[cache_key] = gem_mst_distance
+        total_dist = min_agent_to_gem + gem_mst_distance + min_gem_to_exit
+        movement_turns = self.lower_bound(total_dist, speed_time)
+        gem_pickup_turns = len(search_state.gems)
+        total_min_turns = movement_turns + gem_pickup_turns
+
+        # Use cost for heuristic
+        turn_cost = max(0, total_min_turns - 1) * 3 # winning step free
+        coin_benefit = len(search_state.coins) * 5
+        return max(0, turn_cost - coin_benefit)
+        # return turn_cost
+    
+
+    ## DISTANCE ESTIMATION METHODS
+
+    def manhattan(self, a: tuple[int, int], b: tuple[int, int]) -> int:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+    
+    # Either from cache or compute
+    def get_sssp(self, pos: tuple[int, int], static_map: StaticMap) -> dict[tuple[int, int], int]:
+        if pos not in self.sssp_cache:
+            self.sssp_cache[pos] = self.sssp_dist(pos, static_map)
+        return self.sssp_cache[pos]
+
+    # Adapted from CS2040
+    def sssp_dist(self, source: tuple[int, int], static_map: StaticMap) -> dict[tuple[int, int], int]:
+        """Dijkstra SSSP from source. 
+        Returns dict mapping positions to shortest distance.
+        Walls block movement."""
+        wall_set = static_map.wall_set
+        dist = {source: 0}
+        visited = set()
+        pq = PriorityQueue()
+        pq.push(0, source)
+        movements = [(0, 1), (0, -1), (-1, 0), (1, 0)]
+
+        while pq.__len__() > 0:
+            pos = pq.pop()
+            if pos in visited:
+                continue
+            visited.add(pos)
+            d = dist[pos]
+            for move_x, move_y in movements:
+                new_pos = (pos[0] + move_x, pos[1] + move_y)
+                if not (0 <= new_pos[0] < static_map.width and 0 <= new_pos[1] < static_map.height):
+                    continue
+                if new_pos in wall_set:
+                    continue
+                new_d = d + 1  # uniform cost
+                if new_d < dist.get(new_pos, float('inf')):
+                    dist[new_pos] = new_d
+                    pq.push(new_d, new_pos)
+        return dist
+    
+    # Minimum spanning tree cost for gems (using SSSP), adapted from CS2040
+    def mst_cost(self, gems_pos: tuple[tuple[int, int], ...], static_map: StaticMap) -> int:
+        if len(gems_pos) <= 1:
+            return 0
+        # Precompute SSSP from each gem for pairwise distances
+        gem_dists = {}
+        for g in gems_pos:
+            gem_dists[g] = self.get_sssp(g, static_map)
+        # Prim's algorithm  
+        gems_pos = list(gems_pos)
+        pos_in_mst = set()
+        best_distance = {}
+        pq = PriorityQueue()
+        start = gems_pos[0]
+        best_distance[start] = 0
+        pq.push(0, start)
+        total_cost = 0
+
+        while pq.__len__() > 0:
+            current_pos = pq.pop()
+            if current_pos in pos_in_mst:
+                continue
+            pos_in_mst.add(current_pos)
+            total_cost += best_distance[current_pos]
+
+            cur_dists = gem_dists[current_pos]
+            for pos in gems_pos:
+                if pos in pos_in_mst:
+                    continue
+                distance = cur_dists.get(pos, self.manhattan(current_pos, pos))
+                if pos not in best_distance or distance < best_distance[pos]:
+                    best_distance[pos] = distance
+                    if pos in pq:
+                        del pq[pos]
+                    pq.push(distance, pos)
+
+        return total_cost
+
+    ## UTILITY METHODS 
+    
+    def lower_bound(self, distance: int, speed_time_left: int = 0) -> int:
+        if speed_time_left > 0:
+            speed_dist = min(distance, speed_time_left * 2)
+            normal_dist = distance - speed_dist
+            return (speed_dist + 1) // 2 + normal_dist
+        return distance
+
+    # Reconstruct real GridState from nearest ancestor with GridState
+    def get_grid_state(self, node: Node):
+        if node.state is not None:
+            return node.state
+        # Trace back to nearest ancestor with GridState
+        chain = []
+        current = node
+        while current.state is None:
+            chain.append(current)
+            current = current.parent
+        # Replay using grid_step from nearest ancestor
+        state = current.state
+        for ancestor in reversed(chain):
+            state = grid_step(state, ancestor.act)
+            ancestor.state = state
+        return state
+
+    # General expand call
+    def expand(self, node: Node, ss: SearchState, static_map: StaticMap) -> list[Node]:
+        child_nodes = []
+        agent_pos = ss.agent_pos
+
+        # Determine if can use lightweight transitions
+        no_powerups = (ss.speed_time_left == 0 and ss.shield_usage_left == 0 and ss.phasing_time_left == 0)
+        agent_in_wall = agent_pos in static_map.wall_set
+        can_lightweight = no_powerups and not agent_in_wall
+        for action in Action:
+            if action == Action.WAIT:
+                continue
+            elif action == Action.USE_KEY:
+                if ss.key_inventory <= 0:
+                    continue
+                # Check distance between agent and locked doors <= 1
+                can_unlock = False
+                for locked_door_pos in ss.locked_doors:
+                    if self.manhattan(agent_pos, locked_door_pos) <= 1:
+                        can_unlock = True
+                        break
+                if not can_unlock:
+                    continue
+                # USE_KEY needs internal grid_step
+                self.expand_grid_step(node, ss, action, static_map, child_nodes)
+            elif action == Action.PICK_UP:
+                # Skip if not on pickable
+                if not (agent_pos in ss.coins or agent_pos in ss.gems or
+                        agent_pos in ss.keys or agent_pos in ss.speed_pos or
+                        agent_pos in ss.shield_pos or agent_pos in ss.phasing_pos):
+                    continue
+                is_simple_pickup = (agent_pos in ss.coins or agent_pos in ss.gems or agent_pos in ss.keys)
+                if is_simple_pickup:
+                    self.expand_lightweight_simple_pickup(node, ss, static_map, child_nodes)
+                else:
+                    self.expand_grid_step(node, ss, action, static_map, child_nodes)
+
+            elif action in MOVES:
+                # Skip if target cell is out of grid
+                move_x, move_y = MOVES[action]
+                target = (agent_pos[0] + move_x, agent_pos[1] + move_y)
+                if not (0 <= target[0] < static_map.width and 0 <= target[1] < static_map.height):
+                    continue
+
+                # No active powerups
+                if can_lightweight:
+                    # Walls block
+                    if target in static_map.wall_set:
+                        continue
+                    # Locked doors block
+                    if target in ss.locked_doors:
+                        continue
+                    # Lava minus health
+                    if target in static_map.lava_set:
+                        self.expand_lightweight_lava(node, ss, action, target, static_map, child_nodes)
+                    # Box too complex for lightweight
+                    elif target in ss.boxes:
+                        self.expand_grid_step(node, ss, action, static_map, child_nodes)
+                    # Normal empty grid or exit winning
+                    else:
+                        self.expand_lightweight_move(node, ss, action, target, static_map, child_nodes)
+                # Phasing active but not speed (pass through anything)
+                elif ss.phasing_time_left > 0 and ss.speed_time_left == 0:
+                    self.expand_lightweight_phasing(node, ss, action, target, static_map, child_nodes)
+                # Speed active or agent_in_wall edge case too complex
+                else:
+                    self.expand_grid_step(node, ss, action, static_map, child_nodes)
+
+        return child_nodes
+
+    # Specialised expand: Using internal grid_step
+    def expand_grid_step(self, node: Node, ss: SearchState, action: Action, static_map: StaticMap, child_nodes: list[Node]) -> None:
+        grid_state = self.get_grid_state(node)
+        new_state = grid_step(grid_state, action)
+        if new_state is not None:
+            child_search_state = self.derive_search_state(new_state, ss, action, static_map)
+            step_cost = 0 if new_state.win else 3
+            if action == Action.PICK_UP and ss.agent_pos in ss.coins:
+                step_cost -= 5
+            child_node = Node(parent=node,
+                              act=action,
+                              state=new_state,
+                              search_state=child_search_state,
+                              cost=node.cost + step_cost)
+            child_nodes.append(child_node)
+
+    # Specialised expand: Lightweight move on normal floor (call when no active powerups)
+    def expand_lightweight_move(self, node: Node, ss: SearchState, action: Action, target: tuple[int, int], static_map: StaticMap, child_nodes: list[Node]) -> None:
+        # Lightweight win check
+        is_win = (target == static_map.exit and len(ss.gems) == 0)
+        step_cost = 0 if is_win else 3
+
+        child_search_state = SearchState(
+            agent_pos=target,
+            agent_hp=ss.agent_hp,
+            key_inventory=ss.key_inventory,
+            speed_time_left=0,
+            shield_usage_left=0,
+            phasing_time_left=0,
+            coins=ss.coins,
+            gems=ss.gems,
+            keys=ss.keys,
+            boxes=ss.boxes,
+            locked_doors=ss.locked_doors,
+            speed_pos=ss.speed_pos,
+            shield_pos=ss.shield_pos,
+            phasing_pos=ss.phasing_pos
+        )
+        child_node = Node(parent=node,
+                          act=action,
+                          state=None, # No actual GridState for lightweight
+                          search_state=child_search_state,
+                          lightweight_win=is_win,
+                          cost=node.cost + step_cost)
+        child_nodes.append(child_node)
+
+    # Specialised expand: Lightweight pickup (call when on non-powerups pickable)
+    def expand_lightweight_simple_pickup(self, node: Node, ss: SearchState, static_map: StaticMap, child_nodes: list[Node]) -> None:
+        pos = ss.agent_pos
+        new_coins = ss.coins
+        new_gems = ss.gems
+        new_keys = ss.keys
+        new_key_inv = ss.key_inventory
+        step_cost = 3
+
+        if pos in ss.coins:
+            new_coins = tuple(p for p in ss.coins if p != pos)
+            step_cost = -2  # 3 turn cost - 5 coin value
+        elif pos in ss.gems:
+            new_gems = tuple(p for p in ss.gems if p != pos)
+        elif pos in ss.keys:
+            new_keys = tuple(p for p in ss.keys if p != pos)
+            new_key_inv = ss.key_inventory + 1
+
+        # Timer-based powerups decrement each turn
+        if ss.phasing_time_left > 0:
+            new_phasing_time_left = max(0, ss.phasing_time_left - 1)
+        else:
+            new_phasing_time_left = 0
+        if ss.speed_time_left > 0:
+            new_speed_time_left = max(0, ss.speed_time_left - 1)
+        else:
+            new_speed_time_left = 0
+
+        child_search_state = SearchState(
+            agent_pos=pos,
+            agent_hp=ss.agent_hp,
+            key_inventory=new_key_inv,
+            speed_time_left=new_speed_time_left,
+            shield_usage_left=ss.shield_usage_left,
+            phasing_time_left=new_phasing_time_left,
+            coins=new_coins,
+            gems=new_gems,
+            keys=new_keys,
+            boxes=ss.boxes,
+            locked_doors=ss.locked_doors,
+            speed_pos=ss.speed_pos,
+            shield_pos=ss.shield_pos,
+            phasing_pos=ss.phasing_pos
+        )
+        child_node = Node(parent=node,
+                          act=Action.PICK_UP,
+                          state=None,
+                          search_state=child_search_state,
+                          cost=node.cost + step_cost)
+        child_nodes.append(child_node)
+
+    # Specialised expand: Lightweight phasing move (call when phasing active)
+    def expand_lightweight_phasing(self, node: Node, ss: SearchState, action: Action, target: tuple[int, int], static_map: StaticMap, child_nodes: list[Node]) -> None:
+        # Phasing: everything is passable, no lava damage
+        # Timer decrements by 1 each turn
+        new_phasing = ss.phasing_time_left - 1
+        is_win = (target == static_map.exit and len(ss.gems) == 0)
+        step_cost = 0 if is_win else 3
+
+        child_ss = SearchState(
+            agent_pos=target,
+            agent_hp=ss.agent_hp,  # no lava damage while phasing
+            key_inventory=ss.key_inventory,
+            speed_time_left=0,
+            shield_usage_left=ss.shield_usage_left,
+            phasing_time_left=new_phasing,
+            coins=ss.coins,
+            gems=ss.gems,
+            keys=ss.keys,
+            boxes=ss.boxes,
+            locked_doors=ss.locked_doors,
+            speed_pos=ss.speed_pos,
+            shield_pos=ss.shield_pos,
+            phasing_pos=ss.phasing_pos
+        )
+        child_node = Node(parent=node,
+                          act=action,
+                          state=None,
+                          search_state=child_ss,
+                          lightweight_win=is_win,
+                          cost=node.cost + step_cost)
+        child_nodes.append(child_node)        
+
+    # Specialised expand: Lightweight lava (call when stepping on lava, no powerups active)
+    def expand_lightweight_lava(self, node: Node, ss: SearchState, action: Action, target: tuple[int, int], static_map: StaticMap, child_nodes: list[Node]) -> None:
+        # Deals 2 damage
+        new_hp = ss.agent_hp - 2
+        if new_hp <= 0:
+            return # Dead, prune
+        step_cost = 3
+
+        child_ss = SearchState(
+            agent_pos=target,
+            agent_hp=new_hp,
+            key_inventory=ss.key_inventory,
+            speed_time_left=0,
+            shield_usage_left=0,
+            phasing_time_left=0,
+            coins=ss.coins,
+            gems=ss.gems,
+            keys=ss.keys,
+            boxes=ss.boxes,
+            locked_doors=ss.locked_doors,
+            speed_pos=ss.speed_pos,
+            shield_pos=ss.shield_pos,
+            phasing_pos=ss.phasing_pos
+        )
+        child_node = Node(parent=node,
+                          act=action,
+                          state=None,
+                          search_state=child_ss,
+                          cost=node.cost + step_cost)
+        child_nodes.append(child_node)
+
+    def count_inventory_keys(self, agent_entity: AgentEntity) -> int:
+        count = 0
+        for item in agent_entity.inventory_list:
+            if isinstance(item, KeyEntity):
+                count += 1
+        return count
+    
+    def count_coins(self, search_state: SearchState, static_map: StaticMap) -> int:
+        initial_num_coins = static_map.num_coins
+        current_num_coins = len(search_state.coins)
+        return initial_num_coins - current_num_coins
+
+    # Can't use isinstance() for some reason, so I directly check using name
+    def count_active_powerups(self, agent_entity: AgentEntity) -> tuple[int, int, int]:
+        speed = 0
+        shield = 0
+        phasing = 0
+        for status in agent_entity.status_list:
+            name = status.appearance.name if hasattr(status, 'appearance') else ''
+            if name == 'boots' and status.time_limit is not None:
+                speed = max(speed, status.time_limit.amount)
+            elif name == 'shield' and status.usage_limit is not None:
+                shield = max(shield, status.usage_limit.amount)
+            elif name == 'ghost' and status.time_limit is not None:
+                phasing = max(phasing, status.time_limit.amount)
+        return speed, shield, phasing
+    
+    def info(self) -> dict[str, str]:
+        """Return info about the agent.
+
+        NOTE: This method is optional and intended for debugging in Grid Play only. 
+        You do not need to implement it for Coursemology submission, but it can be 
+        helpful for visualizing your agent's internal state during development. 
+        Implementing this method will not affect grading.
+        """
+        # Optional: return info about the agent
+        return {"name": "Random AI Agent"}
